@@ -13,7 +13,7 @@ from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.tree import DecisionTreeClassifier
 from sklearn.metrics import (
     accuracy_score, precision_score, recall_score, f1_score, 
-    roc_auc_score, classification_report, confusion_matrix
+    roc_auc_score
 )
 from sklearn.pipeline import Pipeline
 import mlflow
@@ -23,10 +23,12 @@ import joblib
 import logging
 from typing import Dict, Any, Tuple
 import warnings
+import config
+
 warnings.filterwarnings('ignore')
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=config.LOGGING_LEVEL)
 logger = logging.getLogger(__name__)
 
 class ModelTrainer:
@@ -41,21 +43,30 @@ class ModelTrainer:
     - Model registration
     """
     
-    def __init__(self, experiment_name: str = "credit_risk_modeling"):
+    def __init__(self):
         """
         Initialize the ModelTrainer.
-        
-        Args:
-            experiment_name: Name for MLflow experiment
         """
-        self.experiment_name = experiment_name
-        self.models = {}
+        self.experiment_name = config.EXPERIMENT_NAME
+        self.models = self._get_model_instances()
         self.best_model = None
+        self.best_model_name = None
         self.best_score = 0
         self.results = {}
         
         # Set up MLflow
-        mlflow.set_experiment(experiment_name)
+        mlflow.set_experiment(self.experiment_name)
+
+    def _get_model_instances(self) -> Dict[str, Any]:
+        """
+        Get model instances from configuration.
+        """
+        model_instances = {}
+        for name, conf in config.MODEL_CONFIGS.items():
+            model_class = globals()[conf['model']]
+            model_instances[name] = model_class(random_state=config.RANDOM_STATE)
+        return model_instances
+
     def prepare_data(self, customer_data: pd.DataFrame, 
                     preprocessing_pipeline: Pipeline) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """
@@ -70,70 +81,34 @@ class ModelTrainer:
         """
         logger.info("Preparing data for model training...")
         
-        # Separate features and target
-        exclude_cols = ['CustomerId', 'is_high_risk', 'cluster', 'last_transaction_date']
-        feature_cols = [col for col in customer_data.columns if col not in exclude_cols]
+        try:
+            # Separate features and target
+            exclude_cols = ['CustomerId', 'is_high_risk', 'cluster', 'last_transaction_date']
+            feature_cols = [col for col in customer_data.columns if col not in exclude_cols]
+
+            X = customer_data[feature_cols]
+            y = customer_data['is_high_risk']
+
+            # Fit and apply preprocessing
+            X_processed = preprocessing_pipeline.fit_transform(X)
+
+            # Split data
+            X_train, X_test, y_train, y_test = train_test_split(
+                X_processed, y, test_size=config.TEST_SIZE,
+                random_state=config.RANDOM_STATE, stratify=y
+            )
+
+            logger.info(f"Data prepared - Train: {X_train.shape}, Test: {X_test.shape}")
+            logger.info(f"Target distribution - Train: {y_train.value_counts().to_dict()}")
+
+            return X_train, X_test, y_train, y_test
         
-        X = customer_data[feature_cols]
-        y = customer_data['is_high_risk']
-        
-        # Fit and apply preprocessing
-        X_processed = preprocessing_pipeline.fit_transform(X)
-        
-        # Split data
-        X_train, X_test, y_train, y_test = train_test_split(
-            X_processed, y, test_size=0.2, random_state=42, stratify=y
-        )
-        
-        logger.info(f"Data prepared - Train: {X_train.shape}, Test: {X_test.shape}")
-        logger.info(f"Target distribution - Train: {y_train.value_counts().to_dict()}")
-        
-        return X_train, X_test, y_train, y_test
-    
-    def get_model_configs(self) -> Dict[str, Dict[str, Any]]:
-        """
-        Get model configurations for training.
-        
-        Returns:
-            Dictionary of model configurations
-        """
-        return {
-            'logistic_regression': {
-                'model': LogisticRegression(random_state=42, max_iter=1000),
-                'params': {
-                    'C': [0.1, 1, 10, 100],
-                    'penalty': ['l1', 'l2'],
-                    'solver': ['liblinear', 'saga']
-                }
-            },
-            'decision_tree': {
-                'model': DecisionTreeClassifier(random_state=42),
-                'params': {
-                    'max_depth': [3, 5, 7, 10, None],
-                    'min_samples_split': [2, 5, 10],
-                    'min_samples_leaf': [1, 2, 4],
-                    'criterion': ['gini', 'entropy']
-                }
-            },
-            'random_forest': {
-                'model': RandomForestClassifier(random_state=42),
-                'params': {
-                    'n_estimators': [100, 200, 300],
-                    'max_depth': [3, 5, 7, 10],
-                    'min_samples_split': [2, 5, 10],
-                    'min_samples_leaf': [1, 2, 4]
-                }
-            },
-            'gradient_boosting': {
-                'model': GradientBoostingClassifier(random_state=42),
-                'params': {
-                    'n_estimators': [100, 200],
-                    'learning_rate': [0.05, 0.1, 0.2],
-                    'max_depth': [3, 5, 7],
-                    'subsample': [0.8, 0.9, 1.0]
-                }
-            }
-        }
+        except KeyError as e:
+            logger.error(f"Missing expected column in data: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Error during data preparation: {e}")
+            raise
     
     def evaluate_model(self, model: Any, X_test: np.ndarray, y_test: np.ndarray) -> Dict[str, float]:
         """
@@ -147,115 +122,103 @@ class ModelTrainer:
         Returns:
             Dictionary of evaluation metrics
         """
-        # Make predictions
-        y_pred = model.predict(X_test)
-        y_pred_proba = model.predict_proba(X_test)[:, 1] if hasattr(model, 'predict_proba') else None
-        
-        # Calculate metrics
-        metrics = {
-            'accuracy': accuracy_score(y_test, y_pred),
-            'precision': precision_score(y_test, y_pred, average='weighted'),
-            'recall': recall_score(y_test, y_pred, average='weighted'),
-            'f1_score': f1_score(y_test, y_pred, average='weighted')
-        }
-        
-        if y_pred_proba is not None:
-            metrics['roc_auc'] = roc_auc_score(y_test, y_pred_proba)
-        
-        return metrics
+        try:
+            # Make predictions
+            y_pred = model.predict(X_test)
+            y_pred_proba = model.predict_proba(X_test)[:, 1] if hasattr(model, 'predict_proba') else None
+
+            # Calculate metrics
+            metrics = {
+                'accuracy': accuracy_score(y_test, y_pred),
+                'precision': precision_score(y_test, y_pred, average='weighted'),
+                'recall': recall_score(y_test, y_pred, average='weighted'),
+                'f1_score': f1_score(y_test, y_pred, average='weighted')
+            }
+
+            if y_pred_proba is not None:
+                metrics['roc_auc'] = roc_auc_score(y_test, y_pred_proba)
+
+            return metrics
+        except Exception as e:
+            logger.error(f"Error during model evaluation: {e}")
+            return {}
     
     def train_model(self, model_name: str, X_train: np.ndarray, X_test: np.ndarray, 
-                   y_train: np.ndarray, y_test: np.ndarray, 
-                   use_grid_search: bool = True) -> Dict[str, Any]:
+                   y_train: np.ndarray, y_test: np.ndarray) -> Dict[str, Any]:
         """
         Train a single model with hyperparameter tuning.
         
         Args:
             model_name: Name of the model to train
             X_train, X_test, y_train, y_test: Train/test data splits
-            use_grid_search: Whether to use grid search for hyperparameter tuning
             
         Returns:
             Dictionary containing trained model and results
         """
         logger.info(f"Training {model_name}...")
         
-        with mlflow.start_run(run_name=model_name):
-            # Get model configuration
-            model_configs = self.get_model_configs()
-            config = model_configs[model_name]
-            
-            # Log model parameters
-            mlflow.log_param("model_type", model_name)
-            mlflow.log_param("use_grid_search", use_grid_search)
-            
-            if use_grid_search and config['params']:
+        with mlflow.start_run(run_name=model_name, nested=True) as run:
+            try:
+                # Get model configuration
+                model = self.models[model_name]
+                params = config.MODEL_CONFIGS[model_name]['params']
+
+                # Log model parameters
+                mlflow.log_param("model_type", model_name)
+
                 # Hyperparameter tuning
                 logger.info(f"Performing hyperparameter tuning for {model_name}...")
                 
-                if model_name in ['random_forest', 'gradient_boosting']:
-                    # Use RandomizedSearchCV for complex models
+                if model_name in config.HYPERPARAMETER_TUNING_CONFIG['use_random_search']:
                     search = RandomizedSearchCV(
-                        config['model'], 
-                        config['params'],
-                        n_iter=20,
-                        cv=5,
-                        scoring='roc_auc',
-                        random_state=42,
-                        n_jobs=-1
+                        model, params,
+                        n_iter=config.HYPERPARAMETER_TUNING_CONFIG['random_search_n_iter'],
+                        cv=config.CV_FOLDS, scoring=config.SCORING_METRIC,
+                        random_state=config.RANDOM_STATE, n_jobs=-1
                     )
                 else:
-                    # Use GridSearchCV for simpler models
                     search = GridSearchCV(
-                        config['model'],
-                        config['params'],
-                        cv=5,
-                        scoring='roc_auc',
-                        n_jobs=-1
+                        model, params, cv=config.CV_FOLDS,
+                        scoring=config.SCORING_METRIC, n_jobs=-1
                     )
                 
                 search.fit(X_train, y_train)
                 best_model = search.best_estimator_
                 
                 # Log best parameters
-                for param, value in search.best_params_.items():
-                    mlflow.log_param(f"best_{param}", value)
+                mlflow.log_params(search.best_params_)
                     
-            else:
-                # Train with default parameters
-                best_model = config['model']
-                best_model.fit(X_train, y_train)
-            
-            # Evaluate model
-            train_metrics = self.evaluate_model(best_model, X_train, y_train)
-            test_metrics = self.evaluate_model(best_model, X_test, y_test)
-            
-            # Log metrics
-            for metric, value in train_metrics.items():
-                mlflow.log_metric(f"train_{metric}", value)
-            
-            for metric, value in test_metrics.items():
-                mlflow.log_metric(f"test_{metric}", value)
-            
-            # Log model
-            signature = infer_signature(X_train, best_model.predict(X_train))
-            mlflow.sklearn.log_model(
-                best_model, 
-                model_name,
-                signature=signature
-            )
-            
-            # Store results
-            result = {
-                'model': best_model,
-                'train_metrics': train_metrics,
-                'test_metrics': test_metrics,
-                'run_id': mlflow.active_run().info.run_id
-            }
-            
-            logger.info(f"{model_name} training completed. Test ROC-AUC: {test_metrics.get('roc_auc', 'N/A'):.4f}")
-            
-            return result
+                # Evaluate model
+                train_metrics = self.evaluate_model(best_model, X_train, y_train)
+                test_metrics = self.evaluate_model(best_model, X_test, y_test)
+
+                # Log metrics
+                mlflow.log_metrics({f"train_{k}": v for k, v in train_metrics.items()})
+                mlflow.log_metrics({f"test_{k}": v for k, v in test_metrics.items()})
+
+                # Log model
+                signature = infer_signature(X_train, best_model.predict(X_train))
+                mlflow.sklearn.log_model(
+                    best_model, model_name, signature=signature
+                )
+
+                # Store results
+                result = {
+                    'model': best_model,
+                    'train_metrics': train_metrics,
+                    'test_metrics': test_metrics,
+                    'run_id': run.info.run_id
+                }
+
+                logger.info(f"{model_name} training completed. Test ROC-AUC: {test_metrics.get('roc_auc', 'N/A'):.4f}")
+
+                return result
+
+            except Exception as e:
+                logger.error(f"Error training {model_name}: {e}")
+                mlflow.set_tag("status", "failed")
+                mlflow.log_param("error_message", str(e))
+                return None
     
     def train_all_models(self, X_train: np.ndarray, X_test: np.ndarray,
                         y_train: np.ndarray, y_test: np.ndarray) -> Dict[str, Any]:
@@ -270,31 +233,24 @@ class ModelTrainer:
         """
         logger.info("Training all models...")
         
-        model_configs = self.get_model_configs()
-        results = {}
-        
-        for model_name in model_configs.keys():
-            try:
+        with mlflow.start_run(run_name="Model_Comparison") as parent_run:
+            for model_name in self.models.keys():
                 result = self.train_model(
                     model_name, X_train, X_test, y_train, y_test
                 )
-                results[model_name] = result
-                
-                # Track best model
-                test_score = result['test_metrics'].get('roc_auc', result['test_metrics']['f1_score'])
-                if test_score > self.best_score:
-                    self.best_score = test_score
-                    self.best_model = result['model']
-                    self.best_model_name = model_name
+                if result:
+                    self.results[model_name] = result
                     
-            except Exception as e:
-                logger.error(f"Error training {model_name}: {str(e)}")
-                continue
+                    # Track best model
+                    test_score = result['test_metrics'].get(config.SCORING_METRIC, 0)
+                    if test_score > self.best_score:
+                        self.best_score = test_score
+                        self.best_model = result['model']
+                        self.best_model_name = model_name
         
-        self.results = results
         logger.info(f"All models trained. Best model: {self.best_model_name} (Score: {self.best_score:.4f})")
         
-        return results
+        return self.results
     
     def compare_models(self) -> pd.DataFrame:
         """
@@ -317,18 +273,16 @@ class ModelTrainer:
         comparison_df = pd.DataFrame(comparison_data)
         
         # Sort by test ROC-AUC or F1 score
-        sort_col = 'test_roc_auc' if 'test_roc_auc' in comparison_df.columns else 'test_f1_score'
-        comparison_df = comparison_df.sort_values(sort_col, ascending=False)
+        sort_col = f'test_{config.SCORING_METRIC}'
+        if sort_col in comparison_df.columns:
+            comparison_df = comparison_df.sort_values(sort_col, ascending=False)
         
         return comparison_df
     
-    def register_best_model(self, model_name: str = "credit_risk_model") -> str:
+    def register_best_model(self) -> str:
         """
         Register the best model in MLflow Model Registry.
         
-        Args:
-            model_name: Name for the registered model
-            
         Returns:
             Model version URI
         """
@@ -337,17 +291,16 @@ class ModelTrainer:
         
         logger.info(f"Registering best model ({self.best_model_name}) to MLflow Model Registry...")
         
-        # Get the run ID of the best model
-        best_result = self.results[self.best_model_name]
-        run_id = best_result['run_id']
-        
-        # Register model
-        model_uri = f"runs:/{run_id}/{self.best_model_name}"
-        
         try:
+            # Get the run ID of the best model
+            run_id = self.results[self.best_model_name]['run_id']
+
+            # Register model
+            model_uri = f"runs:/{run_id}/{self.best_model_name}"
+
             model_version = mlflow.register_model(
                 model_uri=model_uri,
-                name=model_name
+                name=config.REGISTERED_MODEL_NAME
             )
             
             logger.info(f"Model registered successfully. Version: {model_version.version}")
@@ -357,38 +310,28 @@ class ModelTrainer:
             logger.error(f"Error registering model: {str(e)}")
             raise
     
-    def save_model(self, filepath: str = "models/best_model.joblib") -> None:
+    def save_model(self, model: Any, filepath: str) -> None:
         """
-        Save the best model to disk.
+        Save a model to disk.
         
         Args:
-            filepath: Path to save the model
+            model: The model to save.
+            filepath: Path to save the model.
         """
-        if self.best_model is None:
-            raise ValueError("No best model found. Train models first.")
-        
-        import os
-        os.makedirs(os.path.dirname(filepath), exist_ok=True)
-        
-        joblib.dump(self.best_model, filepath)
-        logger.info(f"Best model saved to {filepath}")
-    
-    def save_preprocessing_pipeline(self, pipeline, filepath: str = "models/preprocessing_pipeline.joblib") -> None:
-        """
-        Save the preprocessing pipeline to disk.
-        
-        Args:
-            pipeline: The preprocessing pipeline to save
-            filepath: Path to save the pipeline
-        """
-        import os
-        os.makedirs(os.path.dirname(filepath), exist_ok=True)
-        
-        joblib.dump(pipeline, filepath)
-        logger.info(f"Preprocessing pipeline saved to {filepath}")
+        try:
+            import os
+            os.makedirs(os.path.dirname(filepath), exist_ok=True)
+            joblib.dump(model, filepath)
+            logger.info(f"Model saved to {filepath}")
+        except Exception as e:
+            logger.error(f"Error saving model to {filepath}: {e}")
+            raise
 
 
-if __name__ == "__main__":
+def main():
+    """
+    Main function to run the training pipeline.
+    """
     import os
     import sys
     
@@ -398,66 +341,61 @@ if __name__ == "__main__":
     from data_processing import DataProcessor
     
     # Create necessary directories
-    os.makedirs("data/processed", exist_ok=True)
-    os.makedirs("models", exist_ok=True)
-    os.makedirs("mlruns", exist_ok=True)
+    os.makedirs(config.PROCESSED_DATA_DIR, exist_ok=True)
+    os.makedirs(config.MODELS_DIR, exist_ok=True)
+    os.makedirs(os.path.dirname(config.LOG_FILE), exist_ok=True)
     
     try:
         # Check if raw data exists
-        raw_data_path = "data/raw/data.csv"
-        if not os.path.exists(raw_data_path):
-            print(f"Error: Raw data file not found at {raw_data_path}")
-            print("Please copy the data files to data/raw/ directory first:")
-            print('copy "d:\\10-Academy\\Week5\\Technical Content\\Data\\data.csv" "data\\raw\\"')
-            print('copy "d:\\10-Academy\\Week5\\Technical Content\\Data\\Xente_Variable_Definitions.csv" "data\\raw\\"')
+        if not os.path.exists(config.RAW_DATA_PATH):
+            logger.error(f"Error: Raw data file not found at {config.RAW_DATA_PATH}")
             sys.exit(1)
         
         # Initialize data processor and process raw data
-        print("Processing raw data...")
+        logger.info("Processing raw data...")
         processor = DataProcessor()
         
-        # Use the complete pipeline method instead of individual steps
-        transaction_data, customer_data = processor.process_full_pipeline(raw_data_path)
+        transaction_data, customer_data = processor.process_full_pipeline()
         
         # Save processed data
         processor.save_processed_data(transaction_data, customer_data)
-        print("Processed data saved successfully")
+        logger.info("Processed data saved successfully")
         
         # Initialize trainer
         trainer = ModelTrainer()
         
         # Prepare data for training
-        print("Preparing data for training...")
+        logger.info("Preparing data for training...")
         X_train, X_test, y_train, y_test = trainer.prepare_data(
             customer_data, processor.preprocessing_pipeline
         )
         
         # Train all models
-        print("Training models...")
-        results = trainer.train_all_models(X_train, X_test, y_train, y_test)
+        logger.info("Training models...")
+        trainer.train_all_models(X_train, X_test, y_train, y_test)
         
         # Compare models
         comparison = trainer.compare_models()
-        print("\nModel Comparison:")
-        print(comparison)
+        logger.info("\nModel Comparison:")
+        logger.info(comparison)
         
         # Register best model
-        print("Registering best model...")
+        logger.info("Registering best model...")
         model_uri = trainer.register_best_model()
         
         # Save best model
-        trainer.save_model()
+        trainer.save_model(trainer.best_model, config.BEST_MODEL_PATH)
         
         # Save preprocessing pipeline
-        trainer.save_preprocessing_pipeline(processor.preprocessing_pipeline)
+        trainer.save_model(processor.preprocessing_pipeline, config.PREPROCESSING_PIPELINE_PATH)
         
-        print("\nModel training completed successfully!")
-        print(f"Best model URI: {model_uri}")
+        logger.info("\nModel training completed successfully!")
+        logger.info(f"Best model URI: {model_uri}")
         
     except FileNotFoundError as e:
-        print(f"File not found error: {e}")
-        print("Please ensure all required data files are in the correct locations.")
+        logger.error(f"File not found error: {e}")
     except Exception as e:
-        print(f"An error occurred during training: {e}")
-        import traceback
-        traceback.print_exc()
+        logger.error(f"An error occurred during training: {e}", exc_info=True)
+
+if __name__ == "__main__":
+    main()

@@ -7,8 +7,8 @@ and target variable creation for the credit risk model.
 
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
-from sklearn.preprocessing import StandardScaler, LabelEncoder
+from datetime import datetime
+from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
 from sklearn.pipeline import Pipeline
 from sklearn.compose import ColumnTransformer
@@ -17,10 +17,12 @@ from sklearn.impute import SimpleImputer
 import logging
 from typing import Tuple, Dict, Any
 import warnings
+import config
+
 warnings.filterwarnings('ignore')
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=config.LOGGING_LEVEL)
 logger = logging.getLogger(__name__)
 
 class DataProcessor:
@@ -35,14 +37,11 @@ class DataProcessor:
     - Data preprocessing for ML models
     """
     
-    def __init__(self, snapshot_date: str = None):
+    def __init__(self):
         """
         Initialize the DataProcessor.
-        
-        Args:
-            snapshot_date: Reference date for recency calculation (YYYY-MM-DD format)
         """
-        self.snapshot_date = snapshot_date or datetime.now().strftime('%Y-%m-%d')
+        self.snapshot_date = config.SNAPSHOT_DATE
         self.scaler = StandardScaler()
         self.label_encoders = {}
         self.kmeans_model = None
@@ -183,8 +182,6 @@ class DataProcessor:
             snapshot_dt - rfm_data['last_transaction_date']
         ).dt.days
         
-    # ... existing code ...
-        
         # Handle missing standard deviation (customers with single transaction)
         rfm_data['monetary_std'] = rfm_data['monetary_std'].fillna(0)
         
@@ -213,15 +210,12 @@ class DataProcessor:
         logger.info(f"RFM features calculated for {len(rfm_final)} customers")
         return rfm_final
     
-    def create_risk_labels(self, rfm_df: pd.DataFrame, n_clusters: int = 3, 
-                          random_state: int = 42) -> pd.DataFrame:
+    def create_risk_labels(self, rfm_df: pd.DataFrame) -> pd.DataFrame:
         """
         Create risk labels using K-Means clustering on RFM features.
         
         Args:
             rfm_df: DataFrame with RFM features
-            n_clusters: Number of clusters for K-Means
-            random_state: Random state for reproducibility
             
         Returns:
             pd.DataFrame: DataFrame with risk labels
@@ -229,16 +223,15 @@ class DataProcessor:
         logger.info("Creating risk labels using clustering...")
         
         # Select features for clustering
-        clustering_features = ['recency', 'frequency', 'monetary_sum']
-        X_cluster = rfm_df[clustering_features].copy()
+        X_cluster = rfm_df[config.CLUSTER_FEATURES].copy()
         
         # Scale features for clustering
         X_scaled = self.scaler.fit_transform(X_cluster)
         
         # Perform K-Means clustering
         self.kmeans_model = KMeans(
-            n_clusters=n_clusters, 
-            random_state=random_state,
+            n_clusters=config.N_CLUSTERS,
+            random_state=config.RANDOM_STATE,
             n_init=10
         )
         clusters = self.kmeans_model.fit_predict(X_scaled)
@@ -326,18 +319,21 @@ class DataProcessor:
         logger.info(f"Pipeline created with {len(numeric_features)} numeric and {len(categorical_features)} categorical features")
         return preprocessor
     
-    def process_full_pipeline(self, file_path: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    def process_full_pipeline(self, file_path: str = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """
         Execute the complete data processing pipeline.
         
         Args:
-            file_path: Path to the raw data file
+            file_path: Path to the raw data file. Defaults to path from config.
             
         Returns:
             Tuple[pd.DataFrame, pd.DataFrame]: (transaction_data, customer_features)
         """
         logger.info("Starting full data processing pipeline...")
         
+        if file_path is None:
+            file_path = config.RAW_DATA_PATH
+
         # Load and clean data
         df = self.load_data(file_path)
         df_clean = self.clean_data(df)
@@ -358,23 +354,21 @@ class DataProcessor:
         return df_features, customer_data
     
     def save_processed_data(self, transaction_data: pd.DataFrame, 
-                           customer_data: pd.DataFrame, 
-                           output_dir: str = "data/processed") -> None:
+                           customer_data: pd.DataFrame) -> None:
         """
         Save processed data to files.
         
         Args:
             transaction_data: Processed transaction data
             customer_data: Customer-level features with risk labels
-            output_dir: Directory to save processed data
         """
         import os
-        os.makedirs(output_dir, exist_ok=True)
+        os.makedirs(config.PROCESSED_DATA_DIR, exist_ok=True)
         
-        transaction_data.to_csv(f"{output_dir}/transactions_processed.csv", index=False)
-        customer_data.to_csv(f"{output_dir}/customer_features.csv", index=False)
+        transaction_data.to_csv(config.TRANSACTIONS_PROCESSED_PATH, index=False)
+        customer_data.to_csv(config.CUSTOMER_FEATURES_PATH, index=False)
         
-        logger.info(f"Processed data saved to {output_dir}")
+        logger.info(f"Processed data saved to {config.PROCESSED_DATA_DIR}")
 
 
 def calculate_woe_iv(df: pd.DataFrame, feature_col: str, target_col: str) -> Dict[str, Any]:
@@ -419,9 +413,7 @@ if __name__ == "__main__":
     processor = DataProcessor()
     
     # Process data
-    transaction_data, customer_data = processor.process_full_pipeline(
-        "data/raw/data.csv"
-    )
+    transaction_data, customer_data = processor.process_full_pipeline()
     
     # Save processed data
     processor.save_processed_data(transaction_data, customer_data)
